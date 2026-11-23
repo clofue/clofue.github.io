@@ -542,9 +542,10 @@ All rights reserved.
 <div class="saves-area">
   <div class="saves-header">
     <span class="saves-label">Save files</span>
-    <input type="file" id="fi" accept=".v3,.zip" multiple>
+    <input type="file" id="fi" accept=".v3,.txt,.zip" multiple>
     <button id="demoSaveButton" onclick="loadDemo()" style="font-family:'Playfair Display',serif;font-size:.82rem;background:var(--paper2);color:var(--muted);border:1.5px solid var(--rule);border-radius:3px;padding:4px 14px;cursor:pointer;">🎮 Load Demo Saves</button>
   </div>
+  
   <div class="save-slots" id="saveSlots"></div>
 </div>
 <div id="log">Select one or more .v3 save files to begin.</div>
@@ -5000,6 +5001,11 @@ function removeSave(id){
   else switchTier(currentTier);
   L('Save removed. '+saves.length+' save'+(saves.length===1?'':'s')+' loaded.');
 }
+function saveDateOrder(date){
+  var parts=/^(\d+)\.(\d+)\.(\d+)$/.exec(date);
+  return parts?Number(parts[1])*10000+Number(parts[2])*100+Number(parts[3]):-1;
+}
+
 function fmtDate(s){var p=(s||'').split('.');return p.length>=3?p[0]+'.'+p[1]+'.'+p[2]:s||'?';}
 
 document.getElementById('fi').addEventListener('change',function(){
@@ -5221,7 +5227,7 @@ function updateMapOwnershipNote(id,sv,metric){
 
 
 async function loadSave(file){
-  if(saves.some(function(sv){return sv.name===file.name.replace(/\.v3$/i,'');})){
+  if(saves.some(function(sv){return sv.name===file.name.replace(/\.(?:v3|txt)$/i,'');})){
     L('Already loaded: '+file.name);return;
   }
   L('Reading '+file.name+' ('+Math.round(file.size/1024/1024)+'MB)\u2026');P(2);await tick();
@@ -5230,26 +5236,30 @@ async function loadSave(file){
     L('Decoding\u2026');P(6);await tick();
 
     var bytes=new Uint8Array(buf);
-    if(bytes[0]===80&&bytes[1]===75){
+    var textDecoder=new TextDecoder('utf-8');
+    var preview=textDecoder.decode(bytes.subarray(0,512));
+    var nativeSave=preview.startsWith('SAV');
+    var zipOffset=nativeSave?preview.indexOf("\n")+1:0;
+    var wrappedTextZip=zipOffset>0&&!/^SAV\d{3}[35]/.test(preview);
+    if((!nativeSave||wrappedTextZip)&&bytes[zipOffset]===80&&bytes[zipOffset+1]===75){
       if(typeof JSZip==='undefined')throw new Error('The ZIP library could not load. Try opening the .v3 file directly.');
       L('Extracting '+file.name+'…');
-      var zip=await JSZip.loadAsync(bytes);
+      var zip=await JSZip.loadAsync(bytes.subarray(zipOffset));
       var entries=Object.values(zip.files).filter(function(entry){return !entry.dir;});
-      var savesInZip=entries.filter(function(entry){return /\.v3$/i.test(entry.name);});
-      var gameState=entries.find(function(entry){return /(?:^|\/)gamestate$/i.test(entry.name);});
+      var savesInZip=entries.filter(function(entry){return /\.(?:v3|txt)$/i.test(entry.name);});
+      var gameState=entries.find(function(entry){return /(?:^|\/)gamestate(?:\.txt)?$/i.test(entry.name);});
       if(!gameState&&savesInZip.length!==1){
         throw new Error('Choose a ZIP containing one .v3 save or upload the .v3 files directly.');
       }
       bytes=await (gameState||savesInZip[0]).async('uint8array');
     }
-    var decoder=new TextDecoder('utf-8');
-    var preview=decoder.decode(bytes.subarray(0,512));
+    preview=textDecoder.decode(bytes.subarray(0,512));
     var binary=preview.startsWith('SAV')&&!/^SAV[^\r\n]*\r?\n\s*(?:meta_data\s*=|\{)/.test(preview);
     var partial=false;
     var raw;
     if(binary){
       if(location.hostname!=='127.0.0.1'||location.protocol!=='http:'){
-        throw new Error('Open Victoria 3 Analyser.cmd, then select this save in the browser window it opens.');
+        throw new Error('Saves must be uncompressed to load.');
       }
       L('Decoding compressed save locally…');
       var response=await fetch('/decode',{method:'POST',headers:{'X-Vic3-Decode':'1'},body:bytes});
@@ -5257,7 +5267,7 @@ async function loadSave(file){
       partial=response.headers.get('X-Vic3-Partial')==='1';
       raw=await response.text();
     }else{
-      raw=decoder.decode(bytes);
+      raw=textDecoder.decode(bytes);
     }
     if(!/game_date\s*=|is_main_tag\s*=\s*yes/.test(raw)){
       throw new Error('This file does not contain readable Victoria 3 save data.');
@@ -5275,12 +5285,13 @@ async function loadSave(file){
     var tiers=parseRankings(raw,idx);
     var total=Object.values(tiers).reduce(function(a,b){return a+b.length;},0);
     L('Found '+total+' nations in '+file.name+'. Updating chart\u2026');P(90);await tick();
-    var svObj={id:Date.now()+'_'+Math.random(),name:file.name.replace(/\.v3$/i,''),date:saveDate,ver:saveVer,raw:raw,idx:idx,tiers:tiers};
+    var svObj={id:Date.now()+'_'+Math.random(),name:file.name.replace(/\.(?:v3|txt)$/i,''),date:saveDate,ver:saveVer,raw:raw,idx:idx,tiers:tiers};
     parseStateOwnership(svObj);
     saves.push(svObj);
     document.body.classList.add('has-saves');
     document.getElementById('saveMenu').open=false;
-    saves.sort(function(a,b){return a.date.localeCompare(b.date);});
+    saves.sort(function(a,b){return saveDateOrder(a.date)-saveDateOrder(b.date);});
+    currentMapSave=saves[saves.length-1].id;
     tierCache={};milCache={};playerCache={};marketCache={};marketsCache={};cnstrEmpCache={};syncPlayerTags();
     renderSaveSlots();updateTierButtons();
     document.getElementById('tabBar').style.display='flex';
