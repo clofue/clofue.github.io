@@ -670,6 +670,7 @@ All rights reserved.
     </div>
     <footer class="map-controls">
       <select id="ovMapMetric" hidden>
+        <option value="union" selected>Union</option>
         <option value="political">Political</option>
         <option value="gdp">Estimated GDP</option>
       <option value="prestige">Prestige</option>
@@ -709,7 +710,8 @@ All rights reserved.
     </div>
     <footer class="map-controls">
       <select id="mapMetric" hidden>
-      <option value="political">Political</option>
+        <option value="political" selected>Political</option>
+        <option value="union">Union</option>
       <option value="gdp">Estimated GDP</option>
       <option value="prestige">Prestige</option>
       <option value="literacy">Workforce literacy</option>
@@ -3030,8 +3032,63 @@ function isMapDecentralized(tag,sv){
   return rank?rank==='decentralized_power':Boolean(V3_DECENTRALIZED[tag]);
 }
 
+var politicalMapColors={};
+function politicalCol(tag){
+  if(politicalMapColors[tag]) return politicalMapColors[tag];
+  if(V3_COUNTRY_COLOURS[tag]){politicalMapColors[tag]=V3_COUNTRY_COLOURS[tag]; return politicalMapColors[tag];}
+  var h=0; for(var i=0;i<tag.length;i++) h=(h*31+tag.charCodeAt(i))%360;
+  var s=0.55,v=0.92,hi=Math.floor(h/60)%6,f=h/60-Math.floor(h/60);
+  var p=v*(1-s),q=v*(1-f*s),t2=v*(1-(1-f)*s),r,g,b;
+  if(hi===0){r=v;g=t2;b=p;}else if(hi===1){r=q;g=v;b=p;}
+  else if(hi===2){r=p;g=v;b=t2;}else if(hi===3){r=p;g=q;b=v;}
+  else if(hi===4){r=t2;g=p;b=v;}else{r=v;g=p;b=q;}
+  var mn=90/255; r=mn+r*(1-mn); g=mn+g*(1-mn); b=mn+b*(1-mn);
+  politicalMapColors[tag]=[Math.round(r*255),Math.round(g*255),Math.round(b*255)]; return politicalMapColors[tag];
+}
+
+var UNION_SUBJECT_ACTIONS=new Set(["protectorate","puppet","dominion","personal_union","vassal","tributary","colony","chartered_company","crown_land"]);
+
+function mapUnionData(sv){
+  if(sv._mapUnion)return sv._mapUnion;
+  var overlords=new Map(), colors=new Map();
+  var pacts=/^pacts=\{\s*database=\{/m.exec(sv.raw);
+  if(pacts){
+    var start=pacts.index+pacts[0].lastIndexOf('{');
+    mapDatabaseRecords(blkAt(sv.raw,start,sv.raw.length-start),function(id,record){
+      var action=record.match(/^[ \t]*action="?(\w+)/m);
+      if(!action||!UNION_SUBJECT_ACTIONS.has(action[1]))return;
+      var first=record.match(/^[ \t]*first=(\d+)/m);
+      var second=record.match(/^[ \t]*second=(\d+)/m);
+      var senior=first&&sv.idx[first[1]], junior=second&&sv.idx[second[1]];
+      if(senior&&junior&&senior.tag!==junior.tag)overlords.set(junior.tag,senior.tag);
+    });
+  }
+  var subjectsByRoot=new Map();
+  overlords.forEach(function(parent,subject){
+    var root=parent, visited=new Set([subject]);
+    while(overlords.has(root)&&!visited.has(root)){
+      visited.add(root);
+      root=overlords.get(root);
+    }
+    if(visited.has(root))return;
+    if(!subjectsByRoot.has(root))subjectsByRoot.set(root,[]);
+    subjectsByRoot.get(root).push(subject);
+  });
+  subjectsByRoot.forEach(function(subjects,root){
+    var base=politicalCol(root);
+    subjects.sort().forEach(function(tag,index){
+      var weight=.20+.40*Math.floor(index/2)/Math.max(1,Math.floor((subjects.length-1)/2));
+      var target=index%2?0:255;
+      colors.set(tag,base.map(function(channel){return Math.round(channel+(target-channel)*weight);}));
+    });
+  });
+  sv._mapUnion={overlords:overlords,colors:colors};
+  return sv._mapUnion;
+}
+
 function mapOwnerSwatch(tag,metric,sv){
-  if(metric==='political'&&(tag==='__DECENTRALIZED__'||isMapDecentralized(tag,sv)))return COLONIZABLE_MAP_GRAY;
+  if((metric==='political'||metric==='union')&&(tag==='__DECENTRALIZED__'||isMapDecentralized(tag,sv)))return COLONIZABLE_MAP_GRAY;
+  if(metric==='union'&&tag&&!tag.startsWith('__'))return mapUnionData(sv).colors.get(tag)||politicalCol(tag);
   return V3_COUNTRY_COLOURS[tag]||null;
 }
 
@@ -3132,6 +3189,10 @@ function mapTooltipHtml(px,sv,metric){
   var label=STATE_MAP_METRICS[metric];
   var col=mapOwnerSwatch(tag,metric,sv);
   var swatch=col?'<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:rgb('+col+');margin-right:5px;vertical-align:middle;"></span>':'';
+  if(metric==='union'){
+    var overlord=mapUnionData(sv).overlords.get(tag);
+    return swatch+'<strong>'+nation+'</strong>'+(overlord?'<br>Overlord: '+tagName(overlord):'');
+  }
   if(metric==='prestige'){
     var prestige=mapPrestigeByTag(sv).get(tag);
     return swatch+'<strong>'+nation+'</strong><br>Prestige: '+(prestige===undefined?'No country data':prestige.toLocaleString());
@@ -3149,29 +3210,15 @@ function renderMapToCanvas(sv,metric){
 
   ensureStateMapMetric(sv,metric);
   var prestige=metric==='prestige'?mapPrestigeByTag(sv):null;
-  var allVals=prestige?Array.from(prestige.values()):metric==='political'?[]:Object.values(sv._mapStates).map(function(state){
+  var allVals=prestige?Array.from(prestige.values()):(metric==='political'||metric==='union')?[]:Object.values(sv._mapStates).map(function(state){
     return state.metrics[metric];
   }).filter(Number.isFinite);
   var maxVal=allVals.length?Math.max.apply(null,allVals):1;
   var minVal=allVals.length?Math.min.apply(null,allVals):0;
 
-  // Colour lookup (mirrors valToColor from drawMap)
-  var _pc={};
-  function politicalCol(tag){
-    if(_pc[tag]) return _pc[tag];
-    if(V3_COUNTRY_COLOURS[tag]){_pc[tag]=V3_COUNTRY_COLOURS[tag]; return _pc[tag];}
-    var h=0; for(var i=0;i<tag.length;i++) h=(h*31+tag.charCodeAt(i))%360;
-    var s=0.55,v=0.92,hi=Math.floor(h/60)%6,f=h/60-Math.floor(h/60);
-    var p=v*(1-s),q=v*(1-f*s),t2=v*(1-(1-f)*s),r,g,b;
-    if(hi===0){r=v;g=t2;b=p;}else if(hi===1){r=q;g=v;b=p;}
-    else if(hi===2){r=p;g=v;b=t2;}else if(hi===3){r=p;g=q;b=v;}
-    else if(hi===4){r=t2;g=p;b=v;}else{r=v;g=p;b=q;}
-    var mn=90/255; r=mn+r*(1-mn); g=mn+g*(1-mn); b=mn+b*(1-mn);
-    _pc[tag]=[Math.round(r*255),Math.round(g*255),Math.round(b*255)]; return _pc[tag];
-  }
   function pixelColor(px){
     if(!stateForMapPixel(px))return [10,18,42];
-    if(metric==='political'){
+    if(metric==='political'||metric==='union'){
       var tag=pixelToTag(px,sv);
       if(tag==='__UNCOLONIZED__')return [38,34,28];
       if(tag==='__BORDER_UNKNOWN__')return [75,65,90];
@@ -5163,7 +5210,10 @@ function updateMapOwnershipNote(id,sv,metric){
   var resolved=Object.keys(sv._provinceToTag).length;
   note.textContent=resolved?'Province borders where map data matches the save; other areas use state ownership.':
     'State-level ownership. Province borders require matching Victoria 3 1.15 map data.';
-  if(metric==='political')note.textContent+=' Gray marks decentralized nations. Slate purple marks unresolved borders.';
+  if(metric==='union'||metric==='political'){
+    if(metric==='union')note.textContent+=' Subjects share shades of their top-level overlord’s color.';
+    note.textContent+=' Gray marks decentralized nations. Slate purple marks unresolved borders.';
+  }
   else if(metric==='prestige')note.textContent='Country prestige for the selected save. Dark blue is lower, gold is higher, and grey means no country data.';
   else note.textContent='State values for the selected save. Dark blue is lower, gold is higher, and grey means no state data.'+
     (metric==='gdp'?' Weekly estimate from building goods sales minus goods costs.':'');
